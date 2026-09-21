@@ -1,0 +1,846 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Exceptions\ClinicReferralAssessmentException;
+use App\Models\ClinicAppointment;
+use App\Models\ClinicAttachment;
+use App\Models\ClinicRecord;
+use App\Models\ClinicVital;
+use App\Models\GroomingClinicReferral;
+use App\Models\Notification;
+use App\Services\ClinicAppointmentSequence;
+use App\Services\GroomingClinicReferralAssessmentService;
+use Illuminate\Http\Exceptions\HttpResponseException;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Storage;
+use Throwable;
+
+class AdminClinicController extends Controller
+{
+    private const CLINICAL_CONTENT_EDITABLE_STATUSES = [
+        'checked_in',
+        'in_consultation',
+        'for_payment',
+    ];
+
+    // ── Queue index ──────────────────────────────────────────────────────────
+
+    public function index()
+    {
+        $with = $this->appointmentRelations();
+
+        $incoming = ClinicAppointment::with($with)
+            ->where('appointment_date', now()->toDateString())
+            ->where('status', 'waiting_to_arrive')
+            ->orderBy('created_at')
+            ->get()
+            ->map(fn ($a) => $this->formatAppointment($a));
+
+        $queued = ClinicAppointment::with($with)
+            ->where('appointment_date', now()->toDateString())
+            ->where('status', 'checked_in')
+            ->orderBy('queue_number')
+            ->get()
+            ->map(fn ($a) => $this->formatAppointment($a));
+
+        $inConsultation = ClinicAppointment::with($with)
+            ->where('appointment_date', now()->toDateString())
+            ->where('status', 'in_consultation')
+            ->orderBy('consultation_started_at')
+            ->get()
+            ->map(fn ($a) => $this->formatAppointment($a));
+
+        $forPayment = ClinicAppointment::with($with)
+            ->where('appointment_date', now()->toDateString())
+            ->where('status', 'for_payment')
+            ->orderBy('consultation_finished_at')
+            ->get()
+            ->map(fn ($a) => $this->formatAppointment($a));
+
+        $completed = ClinicAppointment::with($with)
+            ->where('appointment_date', now()->toDateString())
+            ->where('status', 'completed')
+            ->orderBy('updated_at', 'desc')
+            ->get()
+            ->map(fn ($a) => $this->formatAppointment($a));
+
+        return response()->json([
+            'success' => true,
+            'incoming' => $incoming,
+            'queued' => $queued,
+            'in_consultation' => $inConsultation,
+            'for_payment' => $forPayment,
+            'completed' => $completed,
+        ]);
+    }
+
+    public function archivedIndex(Request $request)
+    {
+        $search = trim((string) $request->query('search', ''));
+        $date = trim((string) $request->query('date', ''));
+
+        $query = ClinicAppointment::with($this->appointmentRelations())
+            ->whereIn('status', ['completed', 'cancelled', 'no_show']);
+
+        if ($date !== '') {
+            $query->whereDate('appointment_date', $date);
+        }
+
+        if ($search !== '') {
+            $query->where(function ($archiveQuery) use ($search) {
+                $like = "%{$search}%";
+
+                $archiveQuery
+                    ->where('appointment_reference', 'like', $like)
+                    ->orWhere('chief_complaint', 'like', $like)
+                    ->orWhereHas('user', function ($userQuery) use ($like) {
+                        $userQuery
+                            ->where('first_name', 'like', $like)
+                            ->orWhere('last_name', 'like', $like)
+                            ->orWhere('email', 'like', $like)
+                            ->orWhere('phone', 'like', $like);
+                    })
+                    ->orWhereHas('walkin', function ($walkinQuery) use ($like) {
+                        $walkinQuery
+                            ->where('fname', 'like', $like)
+                            ->orWhere('lname', 'like', $like)
+                            ->orWhere('email', 'like', $like)
+                            ->orWhere('phone', 'like', $like);
+                    })
+                    ->orWhereHas('pet', function ($petQuery) use ($like) {
+                        $petQuery
+                            ->where('pet_name', 'like', $like)
+                            ->orWhere('species', 'like', $like)
+                            ->orWhere('breed', 'like', $like);
+                    });
+            });
+        }
+
+        $archived = $query
+            ->orderByDesc('appointment_date')
+            ->orderByDesc('updated_at')
+            ->get()
+            ->map(fn (ClinicAppointment $appointment) => $this->formatAppointment($appointment))
+            ->values();
+
+        return response()->json([
+            'success' => true,
+            'archived' => $archived,
+            'total' => $archived->count(),
+        ]);
+    }
+
+    // ── Status transitions ───────────────────────────────────────────────────
+
+    public function checkIn(int $id, ClinicAppointmentSequence $clinicSequence)
+    {
+        $appt = DB::transaction(function () use ($id, $clinicSequence) {
+            $appointment = ClinicAppointment::whereKey($id)->lockForUpdate()->firstOrFail();
+
+            if ($appointment->status !== 'waiting_to_arrive') {
+                return null;
+            }
+
+            $queueNumber = $appointment->queue_number;
+
+            if (! $queueNumber) {
+                $queueNumber = $clinicSequence->nextQueueNumber(
+                    $appointment->appointment_date->toDateString(),
+                );
+            }
+
+            $appointment->update([
+                'status' => 'checked_in',
+                'queue_number' => $queueNumber,
+                'checked_in_at' => now(),
+            ]);
+
+            return $appointment;
+        });
+
+        if (! $appt) {
+            return response()->json(['success' => false, 'message' => 'Appointment is not in Waiting to Arrive status.'], 422);
+        }
+
+        return response()->json(['success' => true, 'appointment' => $this->formatAppointment($appt->fresh(['user', 'walkin', 'pet', 'timeWindow', 'vitals', 'record']))]);
+    }
+
+    public function startConsultation(
+        Request $request,
+        int $id,
+        GroomingClinicReferralAssessmentService $assessment,
+    ) {
+        try {
+            $result = $assessment->start($id, $request->user());
+        } catch (ClinicReferralAssessmentException $exception) {
+            return response()->json([
+                'success' => false,
+                'message' => $exception->getMessage(),
+            ], $exception->status);
+        }
+
+        $appointment = $result['appointment']->fresh($this->appointmentRelations());
+
+        return response()->json([
+            'success' => true,
+            'message' => $result['already_synchronized']
+                ? 'Clinic consultation was already started and synchronized.'
+                : 'Clinic consultation started.',
+            'referral_linked' => $result['referral_linked'],
+            'already_synchronized' => $result['already_synchronized'],
+            'appointment' => $this->formatAppointment($appointment),
+        ]);
+    }
+
+    public function finishConsultation(
+        Request $request,
+        int $id,
+        GroomingClinicReferralAssessmentService $assessment,
+    ) {
+        try {
+            $result = $assessment->finish($id, $request->user(), $request->all());
+        } catch (ClinicReferralAssessmentException $exception) {
+            return response()->json([
+                'success' => false,
+                'message' => $exception->getMessage(),
+            ], $exception->status);
+        }
+
+        $appointment = $result['appointment']->fresh($this->appointmentRelations());
+
+        if (! $result['already_synchronized'] && $appointment->status === 'for_payment') {
+            Notification::createForClinic(
+                $appointment,
+                Notification::TYPE_CLINIC_PAYMENT_DUE,
+                "Clinic visit {$appointment->appointment_reference} is ready for payment.",
+            );
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => $result['already_synchronized']
+                ? 'The permanent clinic assessment result was already saved.'
+                : ($result['referral_linked']
+                    ? 'Clinic assessment completed. Grooming remains stopped for this visit.'
+                    : 'Clinic consultation finished.'),
+            'referral_linked' => $result['referral_linked'],
+            'already_synchronized' => $result['already_synchronized'],
+            'appointment' => $this->formatAppointment($appointment),
+            'grooming_payment_readiness' => $result['payment_readiness'],
+        ]);
+    }
+
+    public function markPaid(Request $request, int $id)
+    {
+        $request->validate([
+            'total_amount' => ['required', 'numeric', 'min:0'],
+            'payment_method' => ['required', 'in:cash,gcash,maya,card'],
+        ]);
+
+        $appt = DB::transaction(function () use ($id, $request) {
+            $appointment = ClinicAppointment::query()
+                ->whereKey($id)
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            if ($appointment->status !== 'for_payment') {
+                return null;
+            }
+
+            $appointment->update([
+                'status' => 'completed',
+                'total_amount' => $request->total_amount,
+                'paid' => true,
+            ]);
+            Notification::createForClinic(
+                $appointment,
+                Notification::TYPE_CLINIC_PAYMENT_CONFIRMED,
+                "Payment received for clinic appointment {$appointment->appointment_reference}.",
+            );
+
+            return $appointment;
+        });
+
+        if (! $appt) {
+            return response()->json(['success' => false, 'message' => 'Appointment is not For Payment.'], 422);
+        }
+
+        return response()->json(['success' => true, 'appointment' => $this->formatAppointment($appt->fresh(['user', 'walkin', 'pet', 'timeWindow', 'vitals', 'record']))]);
+    }
+
+    public function cancel(Request $request, int $id)
+    {
+        $appt = DB::transaction(function () use ($id) {
+            $appointment = ClinicAppointment::query()
+                ->whereKey($id)
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            if (in_array($appointment->status, ['completed', 'cancelled'], true)) {
+                return null;
+            }
+
+            $appointment->update(['status' => 'cancelled']);
+            Notification::createForClinic(
+                $appointment,
+                Notification::TYPE_CLINIC_CANCELLED,
+                "Clinic appointment {$appointment->appointment_reference} was cancelled by clinic staff.",
+            );
+
+            return $appointment;
+        });
+
+        if (! $appt) {
+            return response()->json(['success' => false, 'message' => 'Cannot cancel a completed or already-cancelled appointment.'], 422);
+        }
+
+        return response()->json(['success' => true]);
+    }
+
+    // ── Medical record ───────────────────────────────────────────────────────
+
+    public function saveRecord(Request $request, int $id)
+    {
+        $data = $request->validate([
+            'chief_complaint' => ['nullable', 'string', 'max:1000'],
+            'diagnosis' => ['nullable', 'string', 'max:2000'],
+            'findings' => ['nullable', 'string', 'max:2000'],
+            'treatment_given' => ['nullable', 'string', 'max:2000'],
+            'follow_up_date' => ['nullable', 'date'],
+            'follow_up_notes' => ['nullable', 'string', 'max:1000'],
+            'vet_notes' => ['nullable', 'string', 'max:2000'],
+
+            // Vitals
+            'weight_kg' => ['nullable', 'numeric', 'min:0'],
+            'temperature_c' => ['nullable', 'numeric', 'min:0'],
+            'heart_rate_bpm' => ['nullable', 'integer', 'min:0'],
+            'respiratory_rate_bpm' => ['nullable', 'integer', 'min:0'],
+            'body_condition_score' => ['nullable', 'integer', 'min:1', 'max:9'],
+
+            // Medications
+            'medications' => ['nullable', 'array'],
+            'medications.*.drug_name' => ['required', 'string', 'max:200'],
+            'medications.*.dosage' => ['nullable', 'string', 'max:100'],
+            'medications.*.frequency' => ['nullable', 'string', 'max:100'],
+            'medications.*.duration' => ['nullable', 'string', 'max:100'],
+            'medications.*.instructions' => ['nullable', 'string', 'max:500'],
+        ]);
+
+        return DB::transaction(function () use ($data, $id) {
+            $appt = ClinicAppointment::query()
+                ->whereKey($id)
+                ->lockForUpdate()
+                ->firstOrFail();
+            $this->assertClinicalContentEditable($appt);
+
+            // Upsert medical record
+            $record = ClinicRecord::updateOrCreate(
+                ['clinic_appointment_id' => $appt->id],
+                [
+                    'chief_complaint' => $data['chief_complaint'] ?? $appt->chief_complaint,
+                    'diagnosis' => $data['diagnosis'] ?? null,
+                    'findings' => $data['findings'] ?? null,
+                    'treatment_given' => $data['treatment_given'] ?? null,
+                    'follow_up_date' => $data['follow_up_date'] ?? null,
+                    'follow_up_notes' => $data['follow_up_notes'] ?? null,
+                    'vet_notes' => $data['vet_notes'] ?? null,
+                ]
+            );
+
+            // Upsert vitals
+            if (collect([
+                'weight_kg',
+                'temperature_c',
+                'heart_rate_bpm',
+                'respiratory_rate_bpm',
+                'body_condition_score',
+            ])->contains(fn (string $field) => array_key_exists($field, $data))) {
+                ClinicVital::updateOrCreate(
+                    ['clinic_appointment_id' => $appt->id],
+                    [
+                        'weight_kg' => $data['weight_kg'] ?? null,
+                        'temperature_c' => $data['temperature_c'] ?? null,
+                        'heart_rate_bpm' => $data['heart_rate_bpm'] ?? null,
+                        'respiratory_rate_bpm' => $data['respiratory_rate_bpm'] ?? null,
+                        'body_condition_score' => $data['body_condition_score'] ?? null,
+                    ]
+                );
+            }
+
+            // Replace medications
+            if (array_key_exists('medications', $data)) {
+                $record->medications()->delete();
+                foreach ($data['medications'] ?? [] as $med) {
+                    $record->medications()->create($med);
+                }
+            }
+
+            $record->load(['medications', 'attachments']);
+
+            return response()->json([
+                'success' => true,
+                'record' => $this->formatRecord($record, $appt->id),
+            ]);
+        });
+    }
+
+    // ── File upload ──────────────────────────────────────────────────────────
+
+    public function uploadAttachment(Request $request, int $id)
+    {
+        $data = $request->validate([
+            'file' => ['required', 'file', 'max:10240', 'mimes:jpg,jpeg,png,pdf,dcm'],
+            'label' => ['nullable', 'string', 'max:200'],
+        ]);
+
+        return DB::transaction(function () use ($data, $id) {
+            $appt = ClinicAppointment::query()
+                ->whereKey($id)
+                ->lockForUpdate()
+                ->firstOrFail();
+            $this->assertClinicalContentEditable($appt);
+
+            $record = ClinicRecord::firstOrCreate(
+                ['clinic_appointment_id' => $appt->id],
+                ['chief_complaint' => $appt->chief_complaint]
+            );
+
+            $file = $data['file'];
+            $path = $file->store("clinic/attachments/{$appt->id}", 'local');
+
+            if (! $path) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'The attachment could not be stored.',
+                ], 500);
+            }
+
+            try {
+                $attachment = $record->attachments()->create([
+                    'file_name' => $file->getClientOriginalName(),
+                    'file_path' => $path,
+                    'file_type' => $file->getMimeType(),
+                    'file_size_bytes' => $file->getSize(),
+                    'label' => $data['label'] ?? null,
+                ]);
+            } catch (Throwable $exception) {
+                Storage::disk('local')->delete($path);
+
+                throw $exception;
+            }
+
+            return response()->json([
+                'success' => true,
+                'attachment' => $this->formatAttachment($attachment, $appt->id),
+            ]);
+        });
+    }
+
+    public function downloadAttachment(int $id, int $attachmentId)
+    {
+        $attachment = $this->findScopedAttachment($id, $attachmentId);
+        $disk = $this->attachmentDisk($attachment->file_path);
+
+        if ($disk === null) {
+            $this->attachmentNotFound();
+        }
+
+        return Storage::disk($disk)->download(
+            $attachment->file_path,
+            $this->safeDownloadName($attachment),
+            [
+                'Content-Type' => $this->safeMimeType($attachment->file_type),
+                'X-Content-Type-Options' => 'nosniff',
+            ],
+        );
+    }
+
+    public function deleteAttachment(int $id, int $attachmentId)
+    {
+        return DB::transaction(function () use ($attachmentId, $id) {
+            $appointment = ClinicAppointment::query()
+                ->whereKey($id)
+                ->lockForUpdate()
+                ->first();
+            if (! $appointment) {
+                $this->attachmentNotFound();
+            }
+            $this->assertClinicalContentEditable($appointment);
+
+            $attachment = ClinicAttachment::query()
+                ->whereKey($attachmentId)
+                ->whereHas(
+                    'record',
+                    fn ($query) => $query->where('clinic_appointment_id', $id),
+                )
+                ->lockForUpdate()
+                ->first();
+            if (! $attachment) {
+                $this->attachmentNotFound();
+            }
+
+            $disk = $this->attachmentDisk($attachment->file_path);
+            if ($disk !== null && ! Storage::disk($disk)->delete($attachment->file_path)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'The attachment could not be deleted.',
+                ], 500);
+            }
+
+            $attachment->delete();
+
+            return response()->json(['success' => true]);
+        });
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    private function formatAppointment(ClinicAppointment $a): array
+    {
+        $a->loadMissing($this->appointmentRelations());
+        $user = $a->user;
+        $walkin = $a->walkin;
+        $pet = $a->pet;
+        $vitals = Schema::hasTable('clinic_vitals') ? $a->vitals : null;
+        $record = Schema::hasTable('clinic_records') ? $a->record : null;
+        $timeWindow = Schema::hasTable('time_windows') ? $a->timeWindow : null;
+        $referral = Schema::hasTable('grooming_clinic_referrals')
+            ? $a->groomingClinicReferral
+            : null;
+        $bookingPet = $referral?->bookingPet;
+        $booking = $referral?->booking;
+        $concern = $referral?->groomingMedicalConcern;
+        $consentResponse = $referral?->consentResponse;
+        $stoppedReview = $bookingPet && Schema::hasTable('grooming_stopped_payment_reviews')
+            ? $bookingPet->groomingStoppedPaymentReview
+            : null;
+
+        $ownerName = $user
+            ? trim(($user->first_name ?? '').' '.($user->last_name ?? ''))
+            : ($walkin ? trim("{$walkin->fname} {$walkin->lname}") : '—');
+
+        $ownerAccountDeleted = $this->ownerAccountDeleted($a);
+        $contactNumber = $ownerAccountDeleted
+            ? '—'
+            : ($user?->phone ?? $walkin?->phone ?? '—');
+        $ownerEmail = $ownerAccountDeleted ? null : ($user?->email ?? $walkin?->email);
+        $appointmentTypeLabel = $referral
+            ? 'Grooming referral'
+            : match ($a->appointment_type) {
+                'pre_registered' => 'Pre-Registered',
+                'scheduled' => 'Scheduled',
+                default => 'Walk-in',
+            };
+
+        return [
+            'id' => $a->id,
+            'appointment_reference' => $a->appointment_reference,
+            'appointment_type' => $a->appointment_type,
+            'status' => $a->status,
+            'queue_number' => $a->queue_number,
+            'appointment_date' => $a->appointment_date?->toDateString(),
+            'time_window' => $timeWindow ? [
+                'window_id' => $timeWindow->window_id,
+                'window_label' => $timeWindow->displayLabel(),
+                'start_time' => $timeWindow->start_time,
+                'end_time' => $timeWindow->end_time,
+            ] : null,
+            'chief_complaint' => $a->chief_complaint,
+            'total_amount' => $a->total_amount,
+            'paid' => $a->paid,
+            'notes' => $a->notes,
+            'checked_in_at' => $a->checked_in_at?->toIso8601String(),
+            'consultation_started_at' => $a->consultation_started_at?->toIso8601String(),
+            'consultation_finished_at' => $a->consultation_finished_at?->toIso8601String(),
+            'archived_at' => $a->archived_at?->toIso8601String(),
+            'created_at' => $a->created_at?->toIso8601String(),
+            'updated_at' => $a->updated_at?->toIso8601String(),
+            'appointment_type_label' => $appointmentTypeLabel,
+            'final_status_label' => $this->clinicStatusLabel($a->status),
+            'payment_status_label' => $a->paid ? 'Paid' : 'Unpaid',
+            'assigned_veterinarian' => null,
+            'ownerName' => $ownerName,
+            'contactNumber' => $contactNumber,
+            'ownerAccountDeleted' => $ownerAccountDeleted,
+            'owner_account_deleted' => $ownerAccountDeleted,
+            'isWalkin' => $walkin !== null,
+            'owner' => [
+                'name' => $ownerName,
+                'contact_number' => $contactNumber,
+                'email' => $ownerEmail,
+                'customer_type' => $walkin ? 'Walk-in customer' : 'Registered customer',
+                'account_deleted' => $ownerAccountDeleted,
+            ],
+            'pet' => $pet ? [
+                'id' => $pet->pet_id,
+                'name' => $pet->pet_name,
+                'species' => $pet->species,
+                'breed' => $pet->breed,
+                'gender' => $pet->gender,
+                'birthdate' => $pet->birthdate,
+                'weight' => $pet->weight,
+                'color' => $pet->color,
+                'size' => $pet->size,
+                'medical_conditions' => $pet->medical_conditions,
+                'known_allergies' => null,
+                'current_medications' => null,
+            ] : null,
+            'vitals' => $vitals ? [
+                'weight_kg' => $vitals->weight_kg,
+                'temperature_c' => $vitals->temperature_c,
+                'heart_rate_bpm' => $vitals->heart_rate_bpm,
+                'respiratory_rate_bpm' => $vitals->respiratory_rate_bpm,
+                'body_condition_score' => $vitals->body_condition_score,
+            ] : null,
+            'record' => $this->formatRecord($record, $a->id),
+            'grooming_referral' => $referral ? [
+                'public_id' => $referral->public_id,
+                'status' => $referral->status,
+                'status_label' => GroomingClinicReferral::statusLabel($referral->status),
+                'urgency' => $referral->urgency,
+                'urgency_label' => GroomingClinicReferral::urgencyLabel($referral->urgency),
+                'booking_reference' => $booking?->booking_reference,
+                'referral_reason' => $referral->referral_reason,
+                'customer_explanation' => $referral->customer_explanation,
+                'referred_by_name' => $referral->referred_by_name,
+                'referred_at' => $referral->referred_at?->toIso8601String(),
+                'accepted_by_name' => $referral->accepted_by_name,
+                'accepted_at' => $referral->accepted_at?->toIso8601String(),
+                'clinic_review_started_by_name' => $referral->clinic_review_started_by_name,
+                'grooming_state' => $bookingPet?->grooming_state,
+                'grooming_state_label' => $this->groomingStateLabel($bookingPet?->grooming_state),
+                'concern_category' => $concern?->category,
+                'concern_severity' => $concern?->severity,
+                'consent_decision' => $consentResponse?->decision,
+                'consent_response_channel' => $consentResponse?->response_channel,
+                'consent_signature_name' => $consentResponse?->signature_name,
+                'consent_responded_at' => $consentResponse?->responded_at?->toIso8601String(),
+                'assessment_started' => $referral->clinic_review_started_at !== null,
+                'assessment_started_at' => $referral->clinic_review_started_at?->toIso8601String(),
+                'assessment_completed' => $referral->resolved_at !== null,
+                'assessment_completed_at' => $referral->resolved_at?->toIso8601String(),
+                'completed_by_name' => $referral->resolved_by_name,
+                'internal_resolution_notes' => $referral->internal_resolution_notes,
+                'customer_resolution_summary' => $referral->customer_resolution_summary,
+                'grooming_outcome' => 'stopped',
+                'grooming_outcome_label' => 'Grooming Session Stopped',
+                'stopped_payment_review_status' => $stoppedReview ? 'completed' : 'pending',
+            ] : null,
+            'activity' => [
+                'created_by_name' => null,
+                'record_created_at' => $record?->created_at?->toIso8601String(),
+                'assessment_completed_by_name' => $referral?->resolved_by_name,
+                'assessment_completed_at' => $referral?->resolved_at?->toIso8601String()
+                    ?? $a->consultation_finished_at?->toIso8601String(),
+                'edited_by_name' => null,
+                'record_updated_at' => $record?->updated_at?->toIso8601String(),
+                'signed_corrections' => null,
+            ],
+        ];
+    }
+
+    private function appointmentRelations(): array
+    {
+        $relations = [
+            'user',
+            'walkin',
+            'pet',
+        ];
+
+        if (Schema::hasTable('unregistered_customers')
+            && Schema::hasColumn('walkins', 'unregistered_customer_id')) {
+            $relations[] = 'walkin.unregisteredCustomer';
+        }
+
+        if (Schema::hasTable('time_windows')) {
+            $relations[] = 'timeWindow';
+        }
+        if (Schema::hasTable('clinic_vitals')) {
+            $relations[] = 'vitals';
+        }
+        if (Schema::hasTable('clinic_records')) {
+            $relations[] = 'record';
+            if (Schema::hasTable('clinic_medications')) {
+                $relations[] = 'record.medications';
+            }
+            if (Schema::hasTable('clinic_attachments')) {
+                $relations[] = 'record.attachments';
+            }
+        }
+
+        if (Schema::hasTable('grooming_clinic_referrals')) {
+            $relations[] = Schema::hasTable('grooming_stopped_payment_reviews')
+                ? 'groomingClinicReferral.bookingPet.groomingStoppedPaymentReview'
+                : 'groomingClinicReferral.bookingPet';
+
+            if (Schema::hasTable('bookings')) {
+                $relations[] = 'groomingClinicReferral.booking';
+            }
+            if (Schema::hasTable('grooming_medical_concerns')) {
+                $relations[] = 'groomingClinicReferral.groomingMedicalConcern';
+            }
+            if (Schema::hasTable('grooming_medical_concern_responses')) {
+                $relations[] = 'groomingClinicReferral.consentResponse';
+            }
+        }
+
+        return $relations;
+    }
+
+    private function ownerAccountDeleted(ClinicAppointment $appointment): bool
+    {
+        $userAttributes = $appointment->user?->getAttributes() ?? [];
+        if (($userAttributes['account_deleted_at'] ?? null) !== null) {
+            return true;
+        }
+
+        $unregisteredAttributes = $appointment->walkin?->unregisteredCustomer?->getAttributes() ?? [];
+
+        return ($unregisteredAttributes['account_deleted_at'] ?? null) !== null;
+    }
+
+    private function groomingStateLabel(?string $state): string
+    {
+        return match ($state) {
+            'in_progress' => 'In progress',
+            'paused' => 'Paused',
+            'stopped' => 'Stopped',
+            'finished' => 'Finished',
+            default => 'Not started',
+        };
+    }
+
+    private function clinicStatusLabel(?string $status): string
+    {
+        return match ($status) {
+            'waiting_to_arrive' => 'Waiting to Arrive',
+            'checked_in' => 'Checked In',
+            'in_consultation' => 'In Consultation',
+            'for_payment' => 'For Payment',
+            'completed' => 'Completed',
+            'cancelled' => 'Cancelled',
+            'no_show' => 'No Show',
+            default => 'Data is currently unavailable',
+        };
+    }
+
+    private function formatRecord(?ClinicRecord $record, int $appointmentId): ?array
+    {
+        if (! $record) {
+            return null;
+        }
+
+        $record->loadMissing(['medications', 'attachments']);
+
+        return [
+            'id' => $record->id,
+            'chief_complaint' => $record->chief_complaint,
+            'diagnosis' => $record->diagnosis,
+            'findings' => $record->findings,
+            'treatment_given' => $record->treatment_given,
+            'follow_up_date' => $record->follow_up_date?->toDateString(),
+            'follow_up_notes' => $record->follow_up_notes,
+            'vet_notes' => $record->vet_notes,
+            'created_at' => $record->created_at?->toIso8601String(),
+            'updated_at' => $record->updated_at?->toIso8601String(),
+            'medications' => $record->medications->map(fn ($medication) => [
+                'id' => $medication->id,
+                'drug_name' => $medication->drug_name,
+                'dosage' => $medication->dosage,
+                'frequency' => $medication->frequency,
+                'duration' => $medication->duration,
+                'instructions' => $medication->instructions,
+            ])->values(),
+            'attachments' => $record->attachments
+                ->map(fn (ClinicAttachment $attachment) => $this->formatAttachment($attachment, $appointmentId))
+                ->values(),
+        ];
+    }
+
+    private function formatAttachment(ClinicAttachment $attachment, int $appointmentId): array
+    {
+        return [
+            'id' => $attachment->id,
+            'file_name' => $attachment->file_name,
+            'file_type' => $attachment->file_type,
+            'file_size_bytes' => $attachment->file_size_bytes,
+            'label' => $attachment->label,
+            'uploaded_at' => $attachment->created_at?->toIso8601String(),
+            'download_endpoint' => "/api/admin/clinic-appointments/{$appointmentId}/attachments/{$attachment->id}/download",
+        ];
+    }
+
+    private function findScopedAttachment(int $appointmentId, int $attachmentId): ClinicAttachment
+    {
+        $appointmentExists = ClinicAppointment::whereKey($appointmentId)->exists();
+
+        if (! $appointmentExists) {
+            $this->attachmentNotFound();
+        }
+
+        $attachment = ClinicAttachment::query()
+            ->whereKey($attachmentId)
+            ->whereHas('record', fn ($query) => $query->where('clinic_appointment_id', $appointmentId))
+            ->first();
+
+        if (! $attachment) {
+            $this->attachmentNotFound();
+        }
+
+        return $attachment;
+    }
+
+    private function attachmentDisk(string $path): ?string
+    {
+        foreach (['local', 'public'] as $disk) {
+            if (Storage::disk($disk)->exists($path)) {
+                return $disk;
+            }
+        }
+
+        return null;
+    }
+
+    private function safeDownloadName(ClinicAttachment $attachment): string
+    {
+        $fileName = basename(str_replace('\\', '/', $attachment->file_name));
+        $fileName = preg_replace('/[\x00-\x1F\x7F]/u', '', $fileName) ?? '';
+
+        return $fileName !== '' ? $fileName : "clinic-attachment-{$attachment->id}";
+    }
+
+    private function safeMimeType(?string $mimeType): string
+    {
+        return $mimeType && preg_match('/^[a-z0-9.+-]+\/[a-z0-9.+-]+$/i', $mimeType)
+            ? $mimeType
+            : 'application/octet-stream';
+    }
+
+    private function attachmentNotFound(): never
+    {
+        throw new HttpResponseException(response()->json([
+            'success' => false,
+            'message' => 'Attachment not found.',
+        ], 404));
+    }
+
+    private function assertClinicalContentEditable(
+        ClinicAppointment $appointment,
+    ): void {
+        if (in_array(
+            $appointment->status,
+            self::CLINICAL_CONTENT_EDITABLE_STATUSES,
+            true,
+        )) {
+            return;
+        }
+
+        throw new HttpResponseException(response()->json([
+            'success' => false,
+            'message' => 'Clinical records can only be modified while the appointment is Checked In, In Consultation, or For Payment.',
+        ], 409));
+    }
+}

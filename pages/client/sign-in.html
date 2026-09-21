@@ -1,0 +1,149 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="../../assets/images/clinic/Bethlehem_Logo-256.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Cache-Control" content="no-store, must-revalidate" />
+    <title>Sign In | Bethlehem Animal Clinic</title>
+    <!-- Runs before any external script so ?logout=1 always wipes stale tokens,
+         even when the browser serves cached versions of api.js / sign-in.js. -->
+    <script>
+      try {
+        if (new URLSearchParams(window.location.search).get("logout") === "1") {
+          ["admin_token", "customer_token", "user_role"].forEach(function (k) {
+            localStorage.removeItem(k);
+            sessionStorage.removeItem(k);
+          });
+          var cleanUrl = new URL(window.location.href);
+          cleanUrl.searchParams.delete("logout");
+          history.replaceState(
+            null,
+            "",
+            cleanUrl.pathname + cleanUrl.search + cleanUrl.hash
+          );
+        }
+      } catch (e) {}
+    </script>
+    <link rel="stylesheet" href="../../css/output.css" />
+    <link rel="stylesheet" href="../../css/custom.css?ui=20260915-password-reveal" />
+  </head>
+  <body class="min-h-screen bg-slate-100 px-4 py-8">
+    <div class="mx-auto flex min-h-[calc(100vh-4rem)] max-w-2xl items-center justify-center">
+      <div class="w-full rounded-[1.75rem] bg-white shadow-[0_18px_48px_rgba(15,23,42,0.12)]">
+        <div class="px-8 py-10 sm:px-10">
+          <!-- TODO: Add clinic logo / branding above the "Sign In" heading.
+               Recommended: same logo used on signup.html left panel
+               (assets/images/clinic/Bethlehem_Logo-256.png), ~80px, centered. -->
+          <div class="mb-8 text-center">
+            <img class="mx-auto mb-4 h-16 w-auto"
+            src="../../assets/images/clinic/Bethlehem_Logo-256.png"
+            alt="Bethlehem Animal Clinic Logo"
+            class="brand-lockup__mark"
+            />
+            <h2 class="text-3xl font-bold leading-tight text-slate-800">
+              Sign In
+            </h2>
+            <p class="mt-4 text-sm leading-6 text-slate-500">
+              Enter your credentials to access your account.
+            </p>
+          </div>
+
+          <form id="sharedSignInForm" class="space-y-5">
+            <div>
+              <label
+                for="identifier"
+                class="mb-2 block text-base font-semibold text-[#1e3a5f]"
+              >
+                Email, username, or mobile number
+              </label>
+              <input
+                id="identifier"
+                name="identifier"
+                type="text"
+                autocomplete="username"
+                class="w-full rounded-2xl border border-slate-300 bg-white px-4 py-4 text-base text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-[#315b7e] focus:ring-2 focus:ring-[#315b7e]/10"
+                required
+              />
+            </div>
+
+            <div>
+              <label
+                for="password"
+                class="mb-2 block text-base font-semibold text-[#1e3a5f]"
+              >
+                Password
+              </label>
+              <div class="relative">
+                <input
+                  id="password"
+                  name="password"
+                  type="password"
+                  autocomplete="current-password"
+                  class="custom-password-input w-full rounded-2xl border border-slate-300 bg-white px-4 py-4 pr-12 text-base text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-[#315b7e] focus:ring-2 focus:ring-[#315b7e]/10"
+                  required
+                />
+                <button
+                  id="toggleSharedPasswordVisibility"
+                  type="button"
+                  class="absolute inset-y-0 right-0 flex w-12 items-center justify-center text-slate-400 transition hover:text-[#315b7e]"
+                  aria-label="Show password"
+                  title="Show password"
+                >
+                  <svg class="shared-password-icon-closed h-5 w-5 fill-current" viewBox="0 0 256 256" aria-hidden="true" focusable="false"><use href="../../assets/icons/phosphor.svg#eye-slash"></use></svg>
+                  <svg class="shared-password-icon-open hidden h-5 w-5 fill-current" viewBox="0 0 256 256" aria-hidden="true" focusable="false"><use href="../../assets/icons/phosphor.svg#eye"></use></svg>
+                </button>
+              </div>
+            </div>
+
+            <div class="flex flex-col gap-3 text-sm text-slate-500 sm:flex-row sm:items-center sm:justify-between">
+              <label class="inline-flex items-center gap-2 text-slate-600">
+                <input type="checkbox" id="rememberMeCheckbox" class="m-0" />
+                <span>Remember me</span>
+              </label>
+
+              <a href="./forgot-password.html" class="text-[#315b7e] transition hover:text-[#274a66]">
+                Forgot password?
+              </a>
+            </div>
+
+            <div
+              id="sharedSignInMessage"
+              class="hidden rounded-2xl border px-4 py-3 text-sm"
+            ></div>
+
+            <button
+              id="sharedSignInSubmit"
+              type="submit"
+              class="w-full rounded-2xl bg-[#315b7e] px-4 py-4 text-base font-semibold text-white transition hover:bg-[#274a66] disabled:cursor-not-allowed disabled:opacity-70"
+            >
+              <span id="signInBtnLabel">Sign In</span>
+            </button>
+          </form>
+
+          <div class="mt-7 flex flex-col items-center gap-3 text-center text-sm text-slate-500">
+            <p class="m-0">
+              Don't have an account?
+              <a
+                href="./signup.html"
+                class="font-semibold text-[#315b7e] transition hover:text-[#274a66]"
+              >
+                Sign Up
+              </a>
+            </p>
+            <a
+              href="../../index.html"
+              class="text-[#315b7e] transition hover:text-[#274a66]"
+            >
+              Home
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="../../scripts/api.js?v=chatbot-safety-insights-20260830" defer></script>
+    <script src="../../scripts/auth/sign-in.js?v=password-reset-20260828" defer></script>
+    <script src="../../scripts/components/home-ai-chatbot.js?v=chatbot-safety-insights-20260830&ui=20260914-icon-only" defer></script>
+  </body>
+</html>
