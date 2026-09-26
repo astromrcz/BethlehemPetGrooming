@@ -1,21 +1,29 @@
 {
-    "$schema": "https://www.schemastore.org/package.json",
-    "private": true,
-    "type": "module",
-    "scripts": {
-        "build": "npm run build:css && vite build",
-        "build:css": "node node_modules/tailwindcss-v3/lib/cli.js -c tailwind.config.js -i css/input.css -o css/output.css",
-        "watch:css": "npm run build:css -- --watch",
-        "dev": "vite",
-        "test": "node tests/customer-dashboard-history-regression.cjs && node tests/client-settings-loading-regression.cjs && node tests/frontend-auth-session-regression.cjs && node tests/session-inactivity-regression.cjs && node tests/admin-notifications-date-grouping-regression.cjs && node tests/admin-security-settings-regression.cjs"
-    },
-    "devDependencies": {
-        "@tailwindcss/vite": "^4.0.0",
-        "axios": "^1.11.0",
-        "concurrently": "^9.0.1",
-        "laravel-vite-plugin": "^2.0.0",
-        "tailwindcss": "^4.0.0",
-        "tailwindcss-v3": "npm:tailwindcss@3.4.19",
-        "vite": "^7.0.7"
-    }
+  "name": "figma-make-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "format": "oxfmt"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.116.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router": "^8.4.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "oxfmt": "^0.2.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^8.0.5"
+  }
 }

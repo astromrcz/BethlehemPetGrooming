@@ -1,0 +1,43 @@
+/* Tailwind first, then the ported portal theme + the original design stylesheet.
+   custom.css is the app's own design system (brand lockup, portal components,
+   password reveal, etc.) and intentionally loads last so it wins over Tailwind
+   defaults — mirroring the original <link> order (output.css then custom.css). */
+@import 'tailwindcss';
+@import './styles/portal.css';
+@import './styles/custom.css';
+
+/* Tailwind v4 equivalent of the original tailwind.config.js `theme.extend`.
+   Recreates the `portal-*` color, `rounded-portal`, and `shadow-portal*`
+   utilities that portal.css @applies. Colors resolve the runtime CSS vars
+   defined on `.portal-theme` in portal.css. */
+@theme {
+  --radius-portal: 18px;
+  --shadow-portal: var(--portal-shadow);
+  --shadow-portal-button: 0 3px 8px rgb(44 62 80 / 10%);
+  --shadow-portal-dropdown: 0 12px 36px rgb(44 62 80 / 14%);
+
+  --color-portal-canvas: var(--portal-canvas);
+  --color-portal-surface: var(--portal-surface);
+  --color-portal-sidebar: var(--portal-sidebar);
+  --color-portal-surface-soft: var(--portal-surface-soft);
+  --color-portal-icon-surface: var(--portal-icon-surface);
+  --color-portal-border: var(--portal-border);
+  --color-portal-text: var(--portal-text);
+  --color-portal-muted: var(--portal-muted);
+  --color-portal-muted-icon: var(--portal-muted-icon);
+  --color-portal-primary: var(--portal-primary);
+  --color-portal-primary-hover: var(--portal-primary-hover);
+  --color-portal-active: var(--portal-active);
+  --color-portal-accent: var(--portal-accent);
+  --color-portal-success: var(--portal-success);
+  --color-portal-success-soft: var(--portal-success-soft);
+  --color-portal-warning: var(--portal-warning);
+  --color-portal-warning-soft: var(--portal-warning-soft);
+  --color-portal-danger: var(--portal-danger);
+  --color-portal-danger-soft: var(--portal-danger-soft);
+  --color-portal-danger-hover: var(--portal-danger-hover);
+  --color-portal-nav-hover: var(--portal-nav-hover);
+  --color-portal-record: var(--portal-record);
+  --color-portal-reminder: var(--portal-reminder);
+  --color-portal-reminder-border: var(--portal-reminder-border);
+}

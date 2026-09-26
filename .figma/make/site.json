@@ -1,0 +1,10 @@
+{
+  "description": "Manage pet grooming appointments, medical records, inventory, and customer profiles with a seamless, role-based online system for clinics and salons.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
